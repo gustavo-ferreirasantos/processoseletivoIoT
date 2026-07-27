@@ -272,73 +272,100 @@ Preencha todas as seções abaixo de forma **clara, objetiva e técnica**.
 
 ---
 
-### Identificação do Candidato
-
-- **Nome completo:**
-- **GitHub:**
+## Identificação do Candidato
+ 
+- **Nome completo:** Gustavo Ferreira Santos
+- **GitHub:** https://github.com/gustavo-ferreirasantos
 
 ---
-
+ 
 ## Visão Geral da Solução
 
-Descreva, em poucas palavras:
-
-- Qual é o objetivo do seu projeto
-- O que o sistema embarcado simulado faz
-- Como o usuário interage com ele (se aplicável)
-
+<p align="center"><img src="docs/visao_geral.png" width="450"><p>
+ 
+O projeto implementa um **Smart Cooler / Estufa**: um sistema embarcado para monitoramento de qualidade em ambientes refrigerados, estufas ou painéis elétricos, cujo objetivo é detectar duas condições de risco que podem levar à degradação de insumos ou sobreaquecimento de componentes:
+ 
+1. **Exposição térmica prolongada** — a porta/tampa do ambiente permanecendo aberta por tempo excessivo, quebrando o isolamento físico;
+2. **Variação térmica abrupta** — uma subida rápida de temperatura em relação a uma referência estável, indicando falha de refrigeração ou outra anomalia.
+O usuário interage indiretamente com o sistema: ele apenas observa o log via Serial, que reporta em tempo real quando uma condição de risco é detectada e quando o ambiente volta ao normal. Não há atuadores (LEDs, buzzers) no escopo mínimo, o foco da solução é a lógica de decisão e a comunicação de status, que é o que os testes automatizados do Wokwi CI validam.
+ 
 ---
-
+ 
 ## Arquitetura do Sistema Embarcado
+ 
+O `main.py` roda em um único laço principal (`while True`) inteiramente **não-bloqueante**: a cada iteração ele lê os sensores, atualiza o estado e dorme apenas `LOOP_DELAY_MS` (50 ms) antes da próxima leitura. Toda temporização é feita comparando timestamps com `time.ticks_ms()`/`time.ticks_diff()`, nunca com `time.sleep()` de duração longa — isso é essencial porque o Wokwi CI injeta estímulos (mudança do botão, mudança de temperatura) em instantes específicos da simulação, e qualquer bloqueio faria o firmware "perder" essas janelas.
+ 
+Fluxo por iteração do loop:
+ 
+1. **Leitura dos sensores** — estado do botão (`btn1`) e temperatura do MPU6050 (`imu1`).
+2. **Detecção de transição da porta** — comparo o estado atual com o estado da iteração anterior para saber o exato instante em que ela fecha (isso importa para a lógica de referência térmica, explicada abaixo).
+3. **Máquina de tempo de porta aberta** — se a porta está aberta, guardo o timestamp em que isso começou (`door_open_since`) e comparo o tempo decorrido com `LIMITE_TEMPO_X` (5000 ms).
+4. **Máquina de gradiente térmico** — calculo `delta = temp_atual - temp_referencia` e comparo com `LIMITE_VARIACAO_Y` (3.0 °C).
+5. **Máquina de normalização** — só zera os dois alarmes quando porta fechada **e** delta seguro ocorrem **simultaneamente**, com uma pequena janela de confirmação (ver Decisões Técnicas).
+Os três alertas do sistema (`door_alarm_active`, `temp_alarm_active`) são flags independentes, mas a normalização depende do estado combinado das duas — refletindo o requisito de que "ambas as condições" precisam estar seguras ao mesmo tempo.
+ 
 
-Explique a arquitetura lógica do seu projeto, abordando:
-
-- Fluxo principal do programa (`main.py`)
-- Estrutura de estados, loops ou temporizações
-- Como os componentes interagem entre si
-
-Se desejar, utilize tópicos ou um pequeno diagrama em texto.
+<p align="center"><img src="docs/maquina_estados.png" width="450"><p>
 
 ---
-
+ 
 ## Componentes Utilizados na Simulação
+ 
+- **Microcontrolador (ESP32 DevKit C v4)** (`id: esp`) — microcontrolador principal, também conectado ao Serial Monitor virtual do Wokwi para os logs de status.
+<p align="center"><img src="docs/ESP32.png" width="150"><p>
 
-Liste os principais componentes definidos no `diagram.json`, por exemplo:
+- **Sensor de Temperatura (MPU6050 IMU)** (`id: imu1`) — sensor de temperatura, usado aqui apenas pelo seu registrador de temperatura interno, conectado via I2C (SDA → GPIO21, SCL → GPIO22).
+<p align="center"><img src="docs/MPU6050.png" width="200"><p>
 
-- Tipo de placa utilizada
-- LEDs, botões, sensores, atuadores, etc.
-- Função de cada componente no sistema
+- **Botão / pushbutton** (`id: btn1`) — simula o fim-de-curso da porta, conectado ao GPIO4 com um resistor de pull-down (`r1`, 10kΩ) para GND. Fisicamente: pressionado = nível lógico alto (porta fechada); solto = nível lógico baixo (porta aberta) — o que casa com a convenção pedida no enunciado (`Pressionado/Fechado = 1`).
+
+<p align="center"><img src="docs/botao.png" width="150"><p>
 
 ---
-
+ 
 ## Decisões Técnicas Relevantes
-
-Explique brevemente decisões importantes tomadas durante o desenvolvimento, como:
-
-- Organização do código
-- Uso de funções, estados ou constantes
-- Estratégias para temporização ou controle lógico
-
+ 
+**Leitura direta de registrador em vez de biblioteca externa.** Em vez de depender de uma lib MicroPython de terceiros para o MPU6050, o código lê e converte a temperatura diretamente via I2C (registrador `0x41`, fórmula padrão do datasheet `Temp/340.0 + 36.53`). Isso reduz uma dependência externa no `requirements.txt`/imagem Docker e deixa o comportamento do sensor totalmente sob controle e auditável.
+ 
+**Referência térmica capturada por transição, não por leitura contínua.** Esta foi a decisão mais importante do projeto, e surgiu de um bug real encontrado durante os testes: minha primeira versão atualizava `temp_referencia` a cada iteração do loop enquanto a porta estivesse fechada e sem alarme. Isso fazia a referência "perseguir" a leitura atual constantemente — quando o simulador mudava a temperatura de 20°C para 24°C, a referência já tinha virado 24°C antes mesmo do cálculo do delta rodar, e o alarme térmico nunca disparava (confirmado no log do CI: o `test_2` estourava timeout esperando `"ALERTA: Degradacao termica detectada!"`).
+ 
+A correção: a referência agora só é recapturada em dois momentos:
+1. No **instante exato da transição** de porta aberta → fechada (`transicao_para_fechada`), capturando a temperatura "no momento em que o ambiente selou";
+2. Depois disso, só por um **rebaseline lento** (`REBASELINE_INTERVAL_MS = 3000`), permitindo acompanhar deriva térmica normal e lenta do ambiente sem mascarar picos abruptos.
+**Janela de confirmação antes de normalizar.** Outro ajuste motivado por evidência empírica de log: o firmware reagia rápido demais (~50–100 ms) ao fechamento da porta, imprimindo `"Status: Sistema Normalizado."` ainda dentro da janela de `delay: 500ms` que o cenário de teste `test_3.yaml` usa entre fechar a porta e checar a mensagem — fazendo o `wait-serial` do CI perder a linha por uma questão de milissegundos. A correção foi introduzir `CONFIRMACAO_NORMALIZACAO_MS = 600`: o sistema só declara normalização depois que as duas condições ficam seguras por essa janela mínima, o que também funciona como um debounce realista para um sensor de porta físico (evita alternância espúria em uma transição instável).
+ 
+**Constantes nomeadas em vez de números soltos.** Todos os limites (`LIMITE_TEMPO_X`, `LIMITE_VARIACAO_Y`, `LOOP_DELAY_MS`, `REBASELINE_INTERVAL_MS`, `CONFIRMACAO_NORMALIZACAO_MS`) são declarados no topo do arquivo, com comentário explicando o motivo de cada valor escolhido — facilita reajuste fino sem precisar caçar números mágicos espalhados pelo código.
+ 
+**Tratamento defensivo de leitura I2C.** Toda leitura do MPU6050 é envolta em `try/except OSError`, evitando que uma falha pontual de comunicação I2C derrube o firmware inteiro no meio da simulação.
+ 
 ---
-
+ 
 ## Resultados Obtidos
+ 
+O projeto passa nos três cenários definidos (`test_1`, `test_2`, `test_3`), além dos jobs `detect_project` e `build_filesystem` da pipeline:
+ 
+- **Teste 1 (Alarme por Porta Aberta):** a porta abre, o sistema aguarda o tempo limite `X` (5s) e emite corretamente `"ALERTA: Porta aberta por muito tempo!"`.
+- **Teste 2 (Alarme por Elevação Térmica):** com a porta fechada e temperatura de referência em 20°C, uma subida brusca para 24°C (ΔT = 4°C ≥ 3°C) dispara `"ALERTA: Degradacao termica detectada!"` de forma imediata.
+- **Teste 3 (Retorno ao Normal):** partindo de um alarme de porta ativo, o fechamento da porta leva à emissão de `"Status: Sistema Normalizado."` dentro da janela esperada pelo cenário.
+Todas as mensagens batem caractere por caractere com o que o Wokwi CI exige (incluindo acentuação e pontuação), e a arquitetura não-bloqueante garante que nenhuma janela de estímulo do simulador seja perdida.
 
-Descreva o comportamento final do sistema:
 
-- O que funciona corretamente
-- Quais requisitos foram atendidos
-- Resultado observado na simulação do Wokwi
+<p align="center"><img src="docs/resultados1.png" width="700"></p>
+<p align="center"><em>Teste 1 — Alarme por Porta Aberta (Tempo Limite X)</em></p>
 
+<p align="center"><img src="docs/resultados2.png" width="700"></p>
+<p align="center"><em>Teste 2 — Alarme por Elevação Térmica (Variação Y)</em></p>
+
+<p align="center"><img src="docs/resultados3.png" width="700"></p>
+<p align="center"><em>Teste 3 — Retorno ao Estado Normal (Cessação do Alarme)</em></p>
+ 
 ---
-
-## Comentários Adicionais (Opcional)
-
-Utilize este espaço para comentar, se desejar:
-
-- Dificuldades encontradas
-- Limitações da solução
-- Melhorias que você faria com mais tempo
-- Principais aprendizados durante o desafio
+ 
+## Comentários Adicionais
+ 
+A maior dificuldade do desafio não foi a lógica "de livro-texto" (comparar tempos e deltas), mas sim o comportamento **temporal** do sistema simulado: os dois bugs mais importantes (referência térmica "perseguindo" a leitura atual, e a corrida entre a mensagem de normalização e a janela de `wait-serial` do cenário 3) só ficaram visíveis analisando os logs reais do GitHub Actions, não sendo óbvios só de ler o código. Isso reforçou a importância de tratar timing como parte central do design em sistemas embarcados, e não como um detalhe de implementação a ser ajustado depois.
+ 
+Com mais tempo, uma melhoria natural seria adicionar um pequeno filtro de média móvel na leitura de temperatura, para tornar o sistema mais robusto a ruído de sensor sem depender apenas do rebaseline periódico, hoje essa robustez vem principalmente da janela de confirmação e do timing dos rebaselines, o que funciona bem para os cenários testados, mas seria menos elegante diante de leituras mais ruidosas.
 
 ---
 
